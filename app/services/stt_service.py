@@ -248,7 +248,8 @@ async def transcribe_audio_streaming_continuous(audio_queue: asyncio.Queue, samp
     try:
         response_count = 0
         last_interim_text = ""  # Track recent partials to avoid duplicates
-        barging_signal_sent = False  # Track if we already sent barging flag
+        last_interim_lang = "en"
+        had_final_result = False
 
         async with websockets.connect(SONIOX_WS_URL, max_size=None) as ws:
             config = {
@@ -297,8 +298,9 @@ async def transcribe_audio_streaming_continuous(audio_queue: asyncio.Queue, samp
                             detected_lang = detect_language_from_script(transcript_text)
                             print(f"✅ STT FINAL #{response_count}: '{transcript_text}' ({detected_lang})")
                             yield (transcript_text, detected_lang, True)
+                            had_final_result = True
                             last_interim_text = ""
-                            barging_signal_sent = False
+                            last_interim_lang = detected_lang
 
                         # Yield INTERIM results (if enabled and different from last)
                         elif process_interim and transcript_text and transcript_text != last_interim_text and len(transcript_text) > 2:
@@ -306,8 +308,12 @@ async def transcribe_audio_streaming_continuous(audio_queue: asyncio.Queue, samp
                             print(f"🎤 STT interim: '{transcript_text}' ({detected_lang})")
                             yield (transcript_text, detected_lang, False)
                             last_interim_text = transcript_text
+                            last_interim_lang = detected_lang
 
                     if data.get("finished"):
+                        if not had_final_result and last_interim_text:
+                            print(f"⚠️ STT finished without final result, promoting last interim to final: '{last_interim_text}' ({last_interim_lang})")
+                            yield (last_interim_text, last_interim_lang, True)
                         print("✅ Continuous STT stream finished")
                         break
 
@@ -316,11 +322,17 @@ async def transcribe_audio_streaming_continuous(audio_queue: asyncio.Queue, samp
                         error_msg = data.get("error_message", "Unknown error")
                         if error_code == 408:
                             print(f"ℹ️ STT stream ended without more speech ({error_code}: {error_msg})")
+                            if not had_final_result and last_interim_text:
+                                print(f"⚠️ Promoting last interim to final after STT timeout: '{last_interim_text}' ({last_interim_lang})")
+                                yield (last_interim_text, last_interim_lang, True)
                         else:
                             print(f"❌ STT ERROR {error_code}: {error_msg}")
                         break
 
             except asyncio.TimeoutError:
+                if not had_final_result and last_interim_text:
+                    print(f"⚠️ Continuous STT timeout - promoting last interim to final: '{last_interim_text}' ({last_interim_lang})")
+                    yield (last_interim_text, last_interim_lang, True)
                 print("⚠️ Continuous STT timeout - closing stream")
             finally:
                 try:

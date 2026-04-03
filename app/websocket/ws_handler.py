@@ -14,7 +14,8 @@ from app.services.llm_service import process_text_streaming
 from app.services.tts_service import generate_speech_stream_chunked
 from app.services.language_utils import detect_language_from_script
 
-DEFAULT_RESPONSE_AUDIO_MODE = "stream"
+DEFAULT_RESPONSE_AUDIO_MODE = "wav"
+FIXED_FREESWITCH_REPLY_PATH = Path("/tmp/python_reply.wav")
 
 
 def save_wav_file(
@@ -123,6 +124,23 @@ def pcm_to_wav_bytes(pcm_data: bytes, sample_rate: int) -> bytes:
         wav_file.setframerate(sample_rate)
         wav_file.writeframes(pcm_data)
     return buffer.getvalue()
+
+
+def persist_reply_wav(wav_bytes: bytes, target_path: Path = FIXED_FREESWITCH_REPLY_PATH) -> Path:
+    """Save the latest synthesized reply to a predictable path for FreeSWITCH playback."""
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    target_path.write_bytes(wav_bytes)
+    print(f"Saved FreeSWITCH reply WAV: {target_path}")
+    return target_path
+
+
+def clear_fixed_reply_wav(target_path: Path = FIXED_FREESWITCH_REPLY_PATH) -> None:
+    """Remove any stale reply file so FreeSWITCH cannot replay old audio by mistake."""
+    try:
+        target_path.unlink()
+        print(f"Removed stale FreeSWITCH reply WAV: {target_path}")
+    except FileNotFoundError:
+        print(f"No stale FreeSWITCH reply WAV at call start: {target_path}")
 
 
 def pcm_rms(pcm_data: bytes) -> float:
@@ -251,7 +269,7 @@ async def send_wav_tts_reply(
     language_code: str,
     output_sample_rate: int = 8000,
 ) -> None:
-    """Collect TTS PCM, resample, wrap as WAV, and send as one message."""
+    """Collect TTS PCM, resample, wrap as WAV, and save it for FreeSWITCH playback."""
     pcm_parts = []
     total_tts_bytes = 0
 
@@ -262,22 +280,15 @@ async def send_wav_tts_reply(
         pcm_parts.append(resample_pcm(chunk, from_rate=16000, to_rate=output_sample_rate))
 
     pcm_8k = b"".join(pcm_parts)
+    if not pcm_8k:
+        print("No TTS audio generated, skipping reply WAV save.")
+        return
+
     wav_bytes = pcm_to_wav_bytes(pcm_8k, sample_rate=output_sample_rate)
-    payload = {
-        "type": "streamAudio",
-        "data": {
-            "audioDataType": "wav",
-            "sampleRate": output_sample_rate,
-            "isFinalChunk": True,
-            "audioData": base64.b64encode(wav_bytes).decode("utf-8"),
-        },
-    }
-    try:
-        await websocket.send_text(json.dumps(payload))
-        print(f"✅ Sent WAV AI reply in one message: {total_tts_bytes} bytes TTS → {len(pcm_8k)} bytes PCM → {len(wav_bytes)} bytes WAV")
-        print(f"   Audio duration: {len(pcm_8k)/(output_sample_rate*2):.2f}s at {output_sample_rate}Hz")
-    except Exception as e:
-        print(f"❌ WebSocket send error for WAV reply: {e} - client likely disconnected")
+    persist_reply_wav(wav_bytes)
+    print(f"✅ Reply ready: {FIXED_FREESWITCH_REPLY_PATH}")
+    print(f"   TTS→PCM→WAV: {total_tts_bytes} bytes → {len(pcm_8k)} bytes → {len(wav_bytes)} bytes")
+    print(f"   Audio duration: {len(pcm_8k)/(output_sample_rate*2):.2f}s at {output_sample_rate}Hz")
 
 
 class DuplexVoiceBridge:
@@ -293,6 +304,7 @@ class DuplexVoiceBridge:
         self.audio_queue: asyncio.Queue = asyncio.Queue()
         self.transcript_queue: asyncio.Queue = asyncio.Queue()
         self.full_audio_buffer = bytearray()
+        self.generated_reply_path: Path | None = None
 
         self.reply_lock = asyncio.Lock()
         self.running = True
@@ -340,8 +352,8 @@ class DuplexVoiceBridge:
             return
 
         self.running = False
+        print("Closing inbound audio stream and draining STT/LLM/TTS pipeline...")
         await self.audio_queue.put(None)
-        await self.transcript_queue.put(None)
 
         tasks = list(self.background_tasks)
         for task in tasks:
@@ -417,18 +429,30 @@ class DuplexVoiceBridge:
                         if response_text:
                             detected_lang = detect_language_from_script(response_text)
                             print(f"📝 Complete response ready for TTS ({token_count} tokens): '{response_text}' ({detected_lang})\n")
-                            
-                            # Single TTS stream for complete response
-                            current_tts_task = asyncio.create_task(
-                                stream_tts_reply(
-                                    self.websocket,
-                                    response_text,
-                                    language_code=detected_lang,
-                                    output_sample_rate=self.input_sample_rate,
-                                    cancel_event=self.reply_cancel_event,
+
+                            if self.response_audio_mode == "wav":
+                                current_tts_task = asyncio.create_task(
+                                    send_wav_tts_reply(
+                                        self.websocket,
+                                        response_text,
+                                        language_code=detected_lang,
+                                        output_sample_rate=self.input_sample_rate,
+                                    )
                                 )
-                            )
+                            else:
+                                current_tts_task = asyncio.create_task(
+                                    stream_tts_reply(
+                                        self.websocket,
+                                        response_text,
+                                        language_code=detected_lang,
+                                        output_sample_rate=self.input_sample_rate,
+                                        cancel_event=self.reply_cancel_event,
+                                    )
+                                )
                             await current_tts_task
+                            if self.response_audio_mode == "wav" and FIXED_FREESWITCH_REPLY_PATH.exists():
+                                self.generated_reply_path = FIXED_FREESWITCH_REPLY_PATH
+                                print(f"✅ Fresh FreeSWITCH reply file ready: {self.generated_reply_path}")
 
                     except asyncio.CancelledError:
                         print(f"🛑 TTS cancelled (barging)")
@@ -494,6 +518,7 @@ class DuplexVoiceBridge:
 async def handle_websocket(websocket: WebSocket):
     await websocket.accept()
     print("WebSocket accepted")
+    clear_fixed_reply_wav()
 
     bridge = DuplexVoiceBridge(websocket, input_sample_rate=8000)
     bridge.start()
@@ -554,6 +579,11 @@ async def handle_websocket(websocket: WebSocket):
             except Exception as e:
                 print("Save error:", repr(e))
                 traceback.print_exc()
+
+        if bridge.generated_reply_path and bridge.generated_reply_path.exists():
+            print(f"Reply generation completed for this call: {bridge.generated_reply_path}")
+        else:
+            print("No fresh reply WAV was generated for this call.")
 
         try:
             await websocket.close()
