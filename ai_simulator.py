@@ -184,12 +184,8 @@ async def stream_tts_reply(
                     "audioData": base64.b64encode(pcm_8k).decode("utf-8"),
                 },
             }
-            try:
-                await websocket.send_text(json.dumps(payload))
-                print(f"📤 WebSocket chunk {chunk_index}: {len(chunk)} bytes TTS → {len(pcm_8k)} bytes PCM")
-            except Exception as e:
-                print(f"❌ WebSocket send error: {e} - client likely disconnected")
-                return
+            await websocket.send_text(json.dumps(payload))
+            print(f"📤 WebSocket chunk {chunk_index}: {len(chunk)} bytes TTS → {len(pcm_8k)} bytes PCM")
             chunk_index += 1
 
         # Check before sending final chunks
@@ -212,12 +208,8 @@ async def stream_tts_reply(
                     "audioData": base64.b64encode(final_pcm).decode("utf-8"),
                 },
             }
-            try:
-                await websocket.send_text(json.dumps(payload))
-                print(f"📤 WebSocket flush chunk {chunk_index}: {len(final_pcm)} bytes PCM")
-            except Exception as e:
-                print(f"❌ WebSocket send error during flush: {e}")
-                return
+            await websocket.send_text(json.dumps(payload))
+            print(f"📤 WebSocket flush chunk {chunk_index}: {len(final_pcm)} bytes PCM")
             chunk_index += 1
 
         end_payload = {
@@ -232,11 +224,7 @@ async def stream_tts_reply(
                 "audioData": "",
             },
         }
-        try:
-            await websocket.send_text(json.dumps(end_payload))
-        except Exception as e:
-            print(f"❌ WebSocket send error during end marker: {e}")
-            return
+        await websocket.send_text(json.dumps(end_payload))
         print(f"✅ Finished streaming AI reply {reply_id} in {chunk_index} chunks")
         print(f"   TTS→PCM: {total_tts_bytes} bytes → {total_pcm_bytes} bytes")
         print(f"   Stream rate: {output_sample_rate}Hz, {total_pcm_bytes/(output_sample_rate*2):.2f}s of audio")
@@ -272,12 +260,9 @@ async def send_wav_tts_reply(
             "audioData": base64.b64encode(wav_bytes).decode("utf-8"),
         },
     }
-    try:
-        await websocket.send_text(json.dumps(payload))
-        print(f"✅ Sent WAV AI reply in one message: {total_tts_bytes} bytes TTS → {len(pcm_8k)} bytes PCM → {len(wav_bytes)} bytes WAV")
-        print(f"   Audio duration: {len(pcm_8k)/(output_sample_rate*2):.2f}s at {output_sample_rate}Hz")
-    except Exception as e:
-        print(f"❌ WebSocket send error for WAV reply: {e} - client likely disconnected")
+    await websocket.send_text(json.dumps(payload))
+    print(f"✅ Sent WAV AI reply in one message: {total_tts_bytes} bytes TTS → {len(pcm_8k)} bytes PCM → {len(wav_bytes)} bytes WAV")
+    print(f"   Audio duration: {len(pcm_8k)/(output_sample_rate*2):.2f}s at {output_sample_rate}Hz")
 
 
 class DuplexVoiceBridge:
@@ -376,119 +361,90 @@ class DuplexVoiceBridge:
             await self.transcript_queue.put(None)
 
     async def _run_reply_worker(self) -> None:
+        current_llm_task = None
         current_tts_task = None
-        debounce_timer = None
-        pending_transcript = None
-        pending_lang = None
-
-        async def process_transcript_with_streaming_tts(text: str, lang: str) -> None:
-            """Process transcript: stream LLM tokens continuously, then TTS on complete response."""
-            nonlocal current_tts_task
-            
-            try:
-                # Reset cancel event for new reply
-                self.reply_cancel_event.clear()
-
-                full_response = ""
-                final_response = None
-                token_count = 0
-
-                async with self.reply_lock:
-                    try:
-                        # Stream LLM tokens continuously
-                        print(f"🚀 Starting LLM stream processing...")
-                        async for token in process_text_streaming(text, language_code=lang):
-                            if "__TRANSLATED__" in token:
-                                # Extract translated response
-                                parts = token.split("__TRANSLATED__")
-                                if len(parts) > 1:
-                                    final_response = parts[1].split("__END_TRANSLATED__")[0]
-                            else:
-                                # Accumulate tokens
-                                full_response += token
-                                token_count += 1
-                                print(f"🤖 Token {token_count}: '{token}'", end="", flush=True)
-                        
-                        print()  # Newline after token stream
-                        
-                        # Use complete response for TTS (with translation if available)
-                        response_text = final_response if final_response else full_response
-                        
-                        if response_text:
-                            detected_lang = detect_language_from_script(response_text)
-                            print(f"📝 Complete response ready for TTS ({token_count} tokens): '{response_text}' ({detected_lang})\n")
-                            
-                            # Single TTS stream for complete response
-                            current_tts_task = asyncio.create_task(
-                                stream_tts_reply(
-                                    self.websocket,
-                                    response_text,
-                                    language_code=detected_lang,
-                                    output_sample_rate=self.input_sample_rate,
-                                    cancel_event=self.reply_cancel_event,
-                                )
-                            )
-                            await current_tts_task
-
-                    except asyncio.CancelledError:
-                        print(f"🛑 TTS cancelled (barging)")
-                    except Exception as exc:
-                        print(f"Reply send failed: {exc!r}")
-
-            except Exception as exc:
-                print(f"LLM streaming failed: {exc!r}")
 
         while True:
-            try:
-                # Use a short timeout to implement debouncing
-                item = await asyncio.wait_for(self.transcript_queue.get(), timeout=0.3)
-            except asyncio.TimeoutError:
-                # Debounce timer expired - process pending transcript if it exists
-                if pending_transcript and (debounce_timer is None or asyncio.get_event_loop().time() >= debounce_timer):
-                    text_to_process = pending_transcript
-                    lang_to_process = pending_lang
-                    pending_transcript = None
-                    pending_lang = None
-                    
-                    # Cancel ongoing reply if new transcript arrived
-                    if current_tts_task and not current_tts_task.done():
-                        print(f"⏱️ Debounce expired, processing buffered interim result...")
-                        self.reply_cancel_event.set()
-                        try:
-                            await asyncio.wait_for(current_tts_task, timeout=0.5)
-                        except asyncio.TimeoutError:
-                            current_tts_task.cancel()
-                    
-                    await process_transcript_with_streaming_tts(text_to_process, lang_to_process)
-                continue
-
+            item = await self.transcript_queue.get()
             if item is None:
                 break
 
             transcript_text, detected_lang, is_final = item
 
-            # For interim results: buffer and debounce to avoid too many LLM calls
+            # Skip interim results - only process final
             if not is_final:
-                print(f"🎤 INTERIM (buffering): {transcript_text!r}")
-                pending_transcript = transcript_text
-                pending_lang = detected_lang
-                debounce_timer = asyncio.get_event_loop().time() + 0.2  # 200ms debounce
+                print(f"   (queued interim result, waiting for final...)")
                 continue
 
-            # Final result arrived - process it immediately
-            print(f"📝 FINAL Transcript: {transcript_text!r}")
-            pending_transcript = None  # Clear any pending interim
-            
-            # Cancel ongoing reply for final result
+            # Cancel any ongoing reply before starting new one
             if current_tts_task and not current_tts_task.done():
-                print(f"🛑 Cancelling previous response for final transcript...")
+                print(f"🛑 Cancelling previous TTS task for barging...")
                 self.reply_cancel_event.set()
                 try:
-                    await asyncio.wait_for(current_tts_task, timeout=0.5)
+                    await asyncio.wait_for(current_tts_task, timeout=1.0)
                 except asyncio.TimeoutError:
                     current_tts_task.cancel()
-            
-            await process_transcript_with_streaming_tts(transcript_text, detected_lang)
+
+            try:
+                # Reset cancel event for new reply
+                self.reply_cancel_event.clear()
+
+                # Stream LLM response and collect final text
+                full_response = ""
+                final_response = None
+
+                async for token in process_text_streaming(transcript_text, language_code=detected_lang):
+                    if "__TRANSLATED__" in token:
+                        # Extract translated response
+                        parts = token.split("__TRANSLATED__")
+                        if len(parts) > 1:
+                            final_response = parts[1].split("__END_TRANSLATED__")[0]
+                    else:
+                        # Accumulate tokens
+                        full_response += token
+
+                # Use translated response if available, otherwise use accumulated tokens
+                response_text = final_response if final_response else full_response
+
+                if not response_text:
+                    continue
+
+                # Auto-detect the actual language of the response
+                actual_lang = detect_language_from_script(response_text)
+                print(f"🤖 AI response: {response_text!r}")
+                print(f"   Response language detected as: {actual_lang} (input was: {detected_lang})")
+
+                async with self.reply_lock:
+                    try:
+                        if self.response_audio_mode == "wav":
+                            current_tts_task = asyncio.create_task(send_wav_tts_reply(
+                                self.websocket,
+                                response_text,
+                                language_code=actual_lang,
+                                output_sample_rate=self.input_sample_rate,
+                            ))
+                        else:
+                            current_tts_task = asyncio.create_task(stream_tts_reply(
+                                self.websocket,
+                                response_text,
+                                language_code=actual_lang,
+                                output_sample_rate=self.input_sample_rate,
+                                cancel_event=self.reply_cancel_event,
+                            ))
+
+                        # Wait for TTS to complete or be cancelled
+                        await current_tts_task
+
+                    except asyncio.CancelledError:
+                        print(f"🛑 TTS cancelled (barging)")
+                        break
+                    except Exception as exc:
+                        print(f"Reply send failed: {exc!r}")
+                        break
+
+            except Exception as exc:
+                print(f"LLM failed: {exc!r}")
+                continue
 
 
 async def handle_websocket(websocket: WebSocket):
@@ -528,9 +484,6 @@ async def handle_websocket(websocket: WebSocket):
                     continue
 
                 if text_message.strip().lower() == "stop":
-                    print("Stop signal received - waiting for any ongoing TTS to finish...")
-                    # Give the reply worker a moment to complete current TTS streaming
-                    await asyncio.sleep(0.5)
                     break
 
     except WebSocketDisconnect:
@@ -542,9 +495,6 @@ async def handle_websocket(websocket: WebSocket):
 
     finally:
         await bridge.stop()
-        
-        # Wait a moment for any remaining I/O to complete
-        await asyncio.sleep(0.2)
 
         print("Final total bytes:", len(bridge.full_audio_buffer))
         if bridge.full_audio_buffer:
