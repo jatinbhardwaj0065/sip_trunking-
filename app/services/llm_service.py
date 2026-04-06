@@ -1,19 +1,63 @@
 """
 Large Language Model processing using OpenAI GPT-4o-mini
 Supports both batch and streaming responses
-Multilingual support with automatic translation
+Multilingual support with direct in-language responses
 """
 
 import os
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
-from .language_utils import translate_text, get_language_name
+from .language_utils import get_language_name
 
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+VOICE_REPLY_MAX_TOKENS = int(os.getenv("VOICE_REPLY_MAX_TOKENS", "60"))  # Reduced from 80 for faster streaming
 
 # Initialize OpenAI client
 client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+
+
+def _build_messages(text: str, language_code: str = "en", system_prompt: str = None):
+    target_language = get_language_name(language_code)
+    messages = []
+
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    else:
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "You are a helpful AI assistant on a live phone call. "
+                    f"Reply in {target_language}. Keep the answer conversational, natural, and brief. "
+                    "Prefer 1 short sentence or 2 very short sentences. Avoid lists unless the caller asks for them."
+                ),
+            }
+        )
+
+    messages.append({"role": "user", "content": text})
+    return messages
+
+
+async def warmup_llm_connection() -> None:
+    """Prime the OpenAI connection and API endpoint before first call."""
+    if not OPENAI_API_KEY:
+        return
+
+    try:
+        # Send a minimal request to warm up the API and establish connection
+        await client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role": "user", "content": "ok"}],
+            temperature=0.0,
+            max_tokens=5,
+        )
+        print("🔥 LLM warmup complete")
+    except Exception as exc:
+        # Warmup should never block the live call
+        print(f"⚠️ LLM warmup failed: {exc}")
+
 
 async def process_text(text: str, language_code: str = "en", system_prompt: str = None) -> str:
     """
@@ -36,46 +80,18 @@ async def process_text(text: str, language_code: str = "en", system_prompt: str 
         return "I didn't hear anything. Could you please repeat that?"
 
     try:
-        # Translate input to English if needed
-        english_text = text
-        if language_code != "en":
-            lang_name = get_language_name(language_code)
-            print(f"🔄 Translating from {lang_name} to English...")
-            english_text = await translate_text(text, language_code, "en")
-
-        messages = []
-
-        # Add system prompt if provided
-        if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
-        else:
-            # Default system prompt for voice calls
-            messages.append({
-                "role": "system", 
-                "content": "You are a helpful AI assistant on a phone call. Keep responses conversational, concise, and under 100 words. Be friendly and natural."
-            })
-
-        # Add user message (in English)
-        messages.append({"role": "user", "content": english_text})
+        messages = _build_messages(text, language_code=language_code, system_prompt=system_prompt)
 
         # Get response from OpenAI
         response = await client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=OPENAI_MODEL,
             messages=messages,
             temperature=0.0,
-              # Keep responses short for voice calls
+            max_tokens=VOICE_REPLY_MAX_TOKENS,
         )
 
-        ai_response = response.choices[0].message.content
-        print(f"🤖 AI Response (English): {ai_response}")
-
-        # Translate response back to user's language if needed
-        if language_code != "en":
-            lang_name = get_language_name(language_code)
-            print(f"🔄 Translating response back to {lang_name}...")
-            ai_response = await translate_text(ai_response, "en", language_code)
-            print(f"🤖 AI Response ({lang_name}): {ai_response}")
-
+        ai_response = (response.choices[0].message.content or "").strip()
+        print(f"🤖 AI Response ({language_code}): {ai_response}")
         return ai_response
 
     except Exception as e:
@@ -105,56 +121,24 @@ async def process_text_streaming(text: str, language_code: str = "en", system_pr
         return
 
     try:
-        # Translate input to English if needed
-        english_text = text
-        if language_code != "en":
-            lang_name = get_language_name(language_code)
-            print(f"🔄 Translating from {lang_name} to English...")
-            english_text = await translate_text(text, language_code, "en")
-
-        messages = []
-
-        # Add system prompt if provided
-        if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
-        else:
-            # Default system prompt for voice calls
-            messages.append({
-                "role": "system", 
-                "content": "You are a helpful AI assistant on a phone call. Keep responses conversational, concise, and under 100 words. Be friendly and natural."
-            })
-
-        # Add user message (in English)
-        messages.append({"role": "user", "content": english_text})
+        messages = _build_messages(text, language_code=language_code, system_prompt=system_prompt)
 
         # Get streaming response from OpenAI
         stream = await client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=OPENAI_MODEL,
             messages=messages,
             temperature=0.0,
-            stream=True  # Enable streaming
+            max_tokens=VOICE_REPLY_MAX_TOKENS,
+            stream=True,
         )
 
-        # Collect all tokens for translation if needed
-        full_response = ""
         async for chunk in stream:
             if chunk.choices[0].delta.content:
                 token = chunk.choices[0].delta.content
-                full_response += token
                 print(f"🤖 Token: {token}", end="", flush=True)
-                yield token  # Yield English tokens for real-time display
+                yield token
 
-        print()  # New line after streaming complete
-
-        # Translate response back to user's language if needed
-        if language_code != "en":
-            lang_name = get_language_name(language_code)
-            print(f"🔄 Translating response back to {lang_name}...")
-            translated_response = await translate_text(full_response, "en", language_code)
-            print(f"🤖 Final response ({lang_name}): {translated_response}")
-            # Replace the already-yielded English tokens with translated version
-            # by yielding a special marker followed by the full translated text
-            yield f"\n__TRANSLATED__{translated_response}__END_TRANSLATED__"
+        print()
 
     except Exception as e:
         print(f"LLM Streaming Error: {str(e)}")

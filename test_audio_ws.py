@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import websockets
+from websockets.exceptions import ConnectionClosed, ConnectionClosedOK
 
 
 AUDIO_FILE = "myvoice.wav"
@@ -83,14 +84,15 @@ async def send_audio_realtime(websocket, pcm_data: bytes, sample_rate: int) -> N
         print(f"Sent chunk {index}/{total_chunks}: {len(chunk)} bytes")
         await asyncio.sleep(CHUNK_MS / 1000)
 
+    # Leave the websocket open so STT/LLM/TTS can finish and stream the reply
+    # before we ask the server to shut the session down.
     await asyncio.sleep(1.0)
-    await websocket.send("stop")
-    print("Sent stop")
 
 
 async def receive_audio_stream(websocket) -> None:
     """Receive either chunked raw PCM replies or single WAV fallback replies."""
     reply_chunks: dict[str, list[tuple[int, bytes]]] = {}
+    completed_replies: set[str] = set()  # Track which replies we've already saved
 
     try:
         while True:
@@ -137,15 +139,36 @@ async def receive_audio_stream(websocket) -> None:
                 break
 
             if is_final:
+                # Skip empty final chunks - wait for real audio data
                 chunks = reply_chunks.get(reply_id, [])
+                if not chunks:
+                    print(f"⏩ Skipping empty final chunk for {reply_id}, waiting for more data...")
+                    continue
+                
+                if reply_id in completed_replies:
+                    print(f"↩️ Already completed reply {reply_id}, skipping duplicate final chunk")
+                    continue
+                
                 chunks.sort(key=lambda item: item[0])
                 combined_audio = b"".join(chunk for _, chunk in chunks)
                 print(f"Reply {reply_id} complete: {len(chunks)} chunks, {len(combined_audio)} bytes")
                 save_reply_wav(reply_id, combined_audio, sample_rate)
+                completed_replies.add(reply_id)
+                
+                # Wait a bit more for any additional replies, then exit
+                print("Waiting 2 seconds for any additional replies...")
+                try:
+                    await asyncio.wait_for(asyncio.sleep(2), timeout=2)
+                except asyncio.TimeoutError:
+                    pass
                 break
 
     except asyncio.TimeoutError:
         print("Timed out waiting for streamed audio reply")
+    except ConnectionClosedOK:
+        print("WebSocket closed cleanly by server")
+    except ConnectionClosed as exc:
+        print(f"WebSocket closed while waiting for reply: code={exc.code} reason={exc.reason}")
 
 
 def save_reply_wav(reply_id: str, pcm_data: bytes, sample_rate: int) -> Path:
@@ -173,11 +196,34 @@ async def send_audio():
             "responseAudioMode": RESPONSE_AUDIO_MODE,
         }))
         print(f"Requested response audio mode: {RESPONSE_AUDIO_MODE}")
+        sender_task = asyncio.create_task(send_audio_realtime(websocket, pcm_8k, TARGET_SAMPLE_RATE))
+        receiver_task = asyncio.create_task(receive_audio_stream(websocket))
 
-        await asyncio.gather(
-            send_audio_realtime(websocket, pcm_8k, TARGET_SAMPLE_RATE),
-            receive_audio_stream(websocket),
-        )
+        await sender_task
+        print("Audio sent, waiting for TTS response...")
+        
+        try:
+            # Wait up to 15 seconds for the receiver to finish processing
+            await asyncio.wait_for(receiver_task, timeout=15.0)
+            print("Received all audio replies successfully")
+        except asyncio.TimeoutError:
+            print("⚠️ Receiver timeout - TTS may still be processing")
+            receiver_task.cancel()
+            try:
+                await receiver_task
+            except asyncio.CancelledError:
+                pass
+
+        # Give the server a moment to finish any cleanup
+        await asyncio.sleep(0.5)
+        
+        try:
+            await websocket.send("stop")
+            print("Sent stop")
+        except ConnectionClosedOK:
+            print("Server had already closed the WebSocket cleanly")
+        except ConnectionClosed as exc:
+            print(f"WebSocket closed before stop could be sent: code={exc.code} reason={exc.reason}")
 
 
 if __name__ == "__main__":

@@ -19,7 +19,7 @@ SONIOX_API_KEY = os.getenv("SONIOX_API_KEY")
 SONIOX_WS_URL = "wss://stt-rt.soniox.com/transcribe-websocket"
 
 # Import language utilities
-from .language_utils import detect_language_from_script
+from .language_utils import detect_language
 
 
 async def transcribe_audio(audio_data: bytes, audio_format: str = "wav") -> str:
@@ -145,7 +145,7 @@ async def transcribe_audio_streaming(audio_queue: asyncio.Queue, sample_rate: in
                 "sample_rate": sample_rate,
                 "language_hints": ["en", "hi", "kn", "ta", "te", "ml", "gu", "mr", "bn"],  # English first, then other languages
                 "enable_speaker_diarization": False,
-                "enable_language_identification": True,  # Enable this to get better language detection
+                "enable_language_identification": False,
                 "enable_profanity_filter": False,
                 "enable_endpoint_detection": True,
                 "enable_dictation": False
@@ -191,7 +191,7 @@ async def transcribe_audio_streaming(audio_queue: asyncio.Queue, sample_rate: in
                         # Accept any final transcript (any language)
                         if has_final and transcript_text and not received_final:
                             # Detect the language from the script
-                            detected_lang = detect_language_from_script(transcript_text)
+                            detected_lang = detect_language(transcript_text)
                             full_transcript = transcript_text
                             print(f"✅ STT ACCEPTED: '{full_transcript}' (Language: {detected_lang})")
                             yield (full_transcript, detected_lang)
@@ -212,7 +212,7 @@ async def transcribe_audio_streaming(audio_queue: asyncio.Queue, sample_rate: in
 
             except asyncio.TimeoutError:
                 if full_transcript:
-                    detected_lang = detect_language_from_script(full_transcript)
+                    detected_lang = detect_language(full_transcript)
                     print(f"⚠️ STT timeout - using: '{full_transcript}'")
                     yield (full_transcript, detected_lang)
                 else:
@@ -260,7 +260,7 @@ async def transcribe_audio_streaming_continuous(audio_queue: asyncio.Queue, samp
                 "sample_rate": sample_rate,
                 "language_hints": ["en", "hi", "kn", "ta", "te", "ml", "gu", "mr", "bn"],
                 "enable_speaker_diarization": False,
-                "enable_language_identification": True,
+                "enable_language_identification": False,
                 "enable_profanity_filter": False,
                 "enable_endpoint_detection": True,
                 "enable_dictation": False,
@@ -295,7 +295,7 @@ async def transcribe_audio_streaming_continuous(audio_queue: asyncio.Queue, samp
 
                         # Yield FINAL results (always)
                         if has_final and transcript_text:
-                            detected_lang = detect_language_from_script(transcript_text)
+                            detected_lang = detect_language(transcript_text)
                             print(f"✅ STT FINAL #{response_count}: '{transcript_text}' ({detected_lang})")
                             yield (transcript_text, detected_lang, True)
                             had_final_result = True
@@ -304,7 +304,7 @@ async def transcribe_audio_streaming_continuous(audio_queue: asyncio.Queue, samp
 
                         # Yield INTERIM results (if enabled and different from last)
                         elif process_interim and transcript_text and transcript_text != last_interim_text and len(transcript_text) > 2:
-                            detected_lang = detect_language_from_script(transcript_text)
+                            detected_lang = detect_language(transcript_text)
                             print(f"🎤 STT interim: '{transcript_text}' ({detected_lang})")
                             yield (transcript_text, detected_lang, False)
                             last_interim_text = transcript_text
@@ -346,7 +346,7 @@ async def transcribe_audio_streaming_continuous(audio_queue: asyncio.Queue, samp
 async def _send_audio_chunks_to_soniox(ws, audio_queue: asyncio.Queue, sample_rate: int = 16000):
     """
     Send audio chunks from queue to Soniox WebSocket
-    Detects chunk size and throttles to real-time rate to prevent timeouts
+    Sends audio chunks to Soniox as they arrive from the live websocket stream.
 
     Args:
         ws: WebSocket connection
@@ -356,7 +356,6 @@ async def _send_audio_chunks_to_soniox(ws, audio_queue: asyncio.Queue, sample_ra
     try:
         chunk_count = 0
         detected_chunk_size = None
-        send_delay = None
         bytes_per_sample = 2  # 16-bit PCM
 
         while True:
@@ -372,19 +371,12 @@ async def _send_audio_chunks_to_soniox(ws, audio_queue: asyncio.Queue, sample_ra
                     await ws.send(b"")
                     break
 
-                # Detect actual chunk size and calculate send delay on first chunk
+                # Detect actual chunk size for observability
                 if detected_chunk_size is None and len(audio_chunk) > 0:
                     detected_chunk_size = len(audio_chunk)
                     samples_per_chunk = detected_chunk_size // bytes_per_sample
-                    # Time duration represented by this chunk of audio
                     chunk_duration = samples_per_chunk / sample_rate
-                    # Send at real-time rate (1x speed) to match audio duration
-                    send_delay = chunk_duration
                     print(f"📊 STT streaming: {detected_chunk_size} bytes/chunk = {samples_per_chunk} samples = {chunk_duration*1000:.1f}ms per chunk")
-
-                # Apply throttling based on audio duration of chunk
-                if send_delay is not None:
-                    await asyncio.sleep(send_delay)
 
                 # Send audio chunk
                 await ws.send(audio_chunk)
@@ -393,8 +385,8 @@ async def _send_audio_chunks_to_soniox(ws, audio_queue: asyncio.Queue, sample_ra
                 # Log every 5 chunks to reduce spam
                 if chunk_count % 5 == 0 and chunk_count > 0:
                     total_bytes = chunk_count * detected_chunk_size if detected_chunk_size else 0
-                    duration_sec = chunk_count * send_delay if send_delay else 0
-                    print(f"📤 Sent {chunk_count} audio chunks ({total_bytes} bytes, {duration_sec:.1f}s at real-time rate)")
+                    duration_sec = total_bytes / (sample_rate * bytes_per_sample) if total_bytes else 0
+                    print(f"📤 Sent {chunk_count} audio chunks ({total_bytes} bytes, ~{duration_sec:.1f}s audio)")
 
             except asyncio.TimeoutError:
                 print(f"⚠️ Audio queue timeout after {chunk_count} chunks - sending end-of-stream")
